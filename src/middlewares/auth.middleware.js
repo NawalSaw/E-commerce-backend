@@ -1,7 +1,9 @@
-import { User } from "./../models/user.model";
-import ApiError from "./../utils/ApiError";
+import { User } from "./../models/user.model.js";
+import { ApiError } from "./../utils/ApiError.js";
+import jwt from "jsonwebtoken";
+import ApiHandler from "./../utils/ApiHandler.js";
 
-const JWTCheck = async (req, res, next) => {
+const JWTCheck = ApiHandler(async (req, _, next) => {
   const token =
     req.cookies?.accessToken || req.headers?.authorization?.split(" ")[1];
 
@@ -25,6 +27,6 @@ const JWTCheck = async (req, res, next) => {
 
   req.user = user;
   return next();
-};
+});
 
 export default JWTCheck;

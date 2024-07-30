@@ -1,14 +1,16 @@
 import ApiHandler from "./../utils/ApiHandler.js";
 import { User } from "./../models/user.model.js";
-import ApiError from "./../utils/ApiError.js";
+import { ApiError } from "./../utils/ApiError.js";
 import sendMailToUser from "./../utils/Mail.js";
 import ApiResponse from "./../utils/ApiResponse.js";
 import { Otp } from "./../models/otp.model.js";
-import { uploadToCloudinary } from "./../utils/uploadOnCloudinary";
+import { uploadToCloudinary } from "./../utils/uploadOnCloudinary.js";
 import { v2 as cloudinary } from "cloudinary";
 import { Cart } from "./../models/cart.model.js";
-import { WishList } from "../models/wishlist.model.js";
+import { Wishlist } from "../models/wishlist.model.js";
 import { Order } from "../models/order.model.js";
+import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 
 const generateAccessAndRefreshToken = async (user) => {
   const accessToken = await user.generateAccessToken();
@@ -29,7 +31,6 @@ const signupUser = ApiHandler(async (req, res) => {
   if (!username || !email || !password || !fullName) {
     throw new ApiError(400, "All fields are required");
   }
-  username = username.toLowerCase();
 
   const userExists = await User.findOne({ $or: [{ email }, { username }] });
   if (userExists) {
@@ -131,7 +132,7 @@ const reSendOTP = ApiHandler(async (req, res) => {
     throw new ApiError(500, "Something went wrong while creating OTP");
   }
 
-  res.status(201).json(new ApiResponse(201, `OTP sent to ${email} again`));
+  res.status(201).json(new ApiResponse(201, `OTP sent to ${email}`));
 });
 
 const loginUser = ApiHandler(async (req, res) => {
@@ -154,7 +155,7 @@ const loginUser = ApiHandler(async (req, res) => {
     throw new ApiError(404, "incorrect credentials");
   }
 
-  const isMatch = user.comparePassword(password);
+  const isMatch = await user.comparePassword(password);
 
   if (!isMatch) {
     throw new ApiError(404, "incorrect credentials");
@@ -198,14 +199,30 @@ const loginUser = ApiHandler(async (req, res) => {
 });
 
 const resetPassword = ApiHandler(async (req, res) => {
-  const { password } = req.body;
-  if (!password) {
+  const { newPassword, confirmPassword } = req.body;
+  const passwordRegex = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[a-zA-Z]).{8,}$/;
+  if (!newPassword || !confirmPassword || newPassword.trim() === "") {
     throw new ApiError(400, "All fields are required");
+  }
+
+  if (!passwordRegex.test(newPassword)) {
+    throw new ApiError(
+      400,
+      "Password must contain at least one uppercase letter, one lowercase letter, one number and one special character with length 8-20"
+    );
+  }
+
+  if (newPassword.length < 8) {
+    throw new ApiError(400, "Password must be at least 8 characters");
+  }
+
+  if (newPassword !== confirmPassword) {
+    throw new ApiError(400, "Passwords do not match");
   }
 
   const user = await User.findOneAndReplace(
     { _id: req.user._id },
-    { password },
+    { password: newPassword },
     { new: true }
   );
   if (!user) {
@@ -241,11 +258,13 @@ const logOutUser = ApiHandler(async (req, res) => {
 });
 
 const updateUserAvatar = ApiHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const user = await User.findById(req.user._id).select(
+    "-password -refreshToken"
+  );
   if (!user) {
     throw new ApiError(404, "User not found");
   }
-  const avatarLocalPath = req.file.avatar;
+  const avatarLocalPath = req.file.path;
 
   if (!avatarLocalPath) {
     throw new ApiError(400, "Avatar is required");
@@ -257,7 +276,8 @@ const updateUserAvatar = ApiHandler(async (req, res) => {
       .split("/")
       .pop()
       .split(".")[0];
-    await cloudinary.uploader.destroy(avatarPathToDelete);
+    const avatarCloudinaryPath =
+      cloudinary.uploader.destroy(avatarPathToDelete);
   }
 
   const avatar = await uploadToCloudinary(avatarLocalPath);
@@ -266,13 +286,7 @@ const updateUserAvatar = ApiHandler(async (req, res) => {
   await user.save({ validateBeforeSave: false });
   res
     .status(200)
-    .json(
-      new ApiResponse(
-        200,
-        user.select("-password -refreshToken"),
-        "User avatar updated successfully"
-      )
-    );
+    .json(new ApiResponse(200, user, "User avatar updated successfully"));
 });
 
 const updateUserPassword = ApiHandler(async (req, res) => {
@@ -286,6 +300,21 @@ const updateUserPassword = ApiHandler(async (req, res) => {
     confirmPassword.trim() === ""
   ) {
     throw new ApiError(400, "All fields are required");
+  }
+
+  // Modified regex for a string password
+  // Example password: Abc1@A
+  const passwordRegex = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z])(?=.*[a-zA-Z]).{8,}$/;
+
+  if (!passwordRegex.test(newPassword.toString())) {
+    throw new ApiError(
+      400,
+      "Password must contain at least one uppercase letter, one lowercase letter, one number and one special character with length 8-20"
+    );
+  }
+
+  if (newPassword.length < 8) {
+    throw new ApiError(400, "Password must be at least 8 characters");
   }
 
   if (newPassword !== confirmPassword) {
@@ -310,18 +339,19 @@ const updateUserPassword = ApiHandler(async (req, res) => {
 });
 
 const createUserAddress = ApiHandler(async (req, res) => {
-  const { address } = req.body;
-  if (!address) {
+  const { localAddress, country, state, city, pincode } = req.body;
+  if (!localAddress || !country || !state || !city || !pincode) {
     throw new ApiError(400, "All fields are required");
   }
 
   const updatedUser = await User.findByIdAndUpdate(
     req.user._id,
     {
-      $push: { address },
+      $push: { address: { localAddress, country, state, city, pincode } },
     },
     { new: true }
-  );
+  ).select("-password -refreshToken");
+
   if (!updatedUser) {
     throw new ApiError(404, "error while creating address");
   }
@@ -331,17 +361,18 @@ const createUserAddress = ApiHandler(async (req, res) => {
 });
 
 const removeUserAddress = ApiHandler(async (req, res) => {
-  const { address } = req.body;
-  if (!address) {
+  const { localAddress, country, state, city, pincode } = req.body;
+  if (!localAddress || !country || !state || !city || !pincode) {
     throw new ApiError(400, "All fields are required");
   }
   const updatedUser = await User.findByIdAndUpdate(
     req.user._id,
     {
-      $pull: { address },
+      $pull: { address: { localAddress, country, state, city, pincode } },
     },
     { new: true }
-  );
+  ).select("-password -refreshToken");
+
   if (!updatedUser) {
     throw new ApiError(404, "error while creating address");
   }
@@ -356,17 +387,41 @@ const updateUserDetails = ApiHandler(async (req, res) => {
     throw new ApiError(400, "At least one field is required");
   }
 
-  const user = await User.findById(req.user._id);
+  const user = await User.findById(req.user._id).select(
+    "-password -refreshToken"
+  );
   if (!user) {
     throw new ApiError(404, "User not found");
   }
 
   if (username) {
+    const userExists = await User.findOne({ username });
+    if (userExists) {
+      throw new ApiError(400, "User already exists");
+    }
+
     user.username = username.toLowerCase();
   }
 
   if (email) {
+    const userExists = await User.findOne({ email });
+    if (userExists) {
+      throw new ApiError(400, "User with this email already exists");
+    }
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpEntry = await Otp.create({
+      code,
+      email,
+    });
+
+    if (!otpEntry) {
+      throw new ApiError(500, "Something went wrong while creating OTP");
+    }
+    sendMailToUser(email, code);
     user.email = email;
+    return res
+      .status(200)
+      .json(new ApiResponse(200, user, "OTP sent successfully"));
   }
 
   if (fullName) {
@@ -380,6 +435,59 @@ const updateUserDetails = ApiHandler(async (req, res) => {
     .json(new ApiResponse(200, user, "User details updated successfully"));
 });
 
+const refreshAccessToken = ApiHandler(async (req, res) => {
+  // get the refresh token from the request cookie
+  // verify the refresh token
+  // get the user from the database
+  // generate new access and refresh token
+  // set the access and refresh token in the cookie
+  // send response
+
+  const refreshToken = req.cookies.refreshToken || req.body.refreshToken;
+  if (!refreshToken) {
+    throw new ApiError(400, "Refresh token is required");
+  }
+
+  const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+  if (!decoded) {
+    throw new ApiError(401, "Invalid refresh token");
+  }
+
+  const user = await User.findById(decoded._id);
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  if (user.refreshToken !== refreshToken) {
+    throw new ApiError(401, "unauthorized to refresh access token");
+  }
+
+  const { accessToken, refreshToken: newRefreshToken } =
+    await generateAccessAndRefreshToken(user);
+
+  res
+    .cookie("refreshToken", newRefreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    })
+    .cookie("accessToken", accessToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      maxAge: 2 * 60 * 60 * 1000, // 2 hours
+    })
+    .status(200)
+    .json(
+      new ApiResponse(
+        200,
+        { accessToken, refreshToken: newRefreshToken },
+        "Access token refreshed successfully"
+      )
+    );
+});
+
 const getProductInUserCart = ApiHandler(async (req, res) => {
   // get the cart from the database which have req.user._id in its user field
   // get the productIds from the cart
@@ -390,7 +498,7 @@ const getProductInUserCart = ApiHandler(async (req, res) => {
   const userProductsInCart = await Cart.aggregate([
     {
       $match: {
-        user: mongoose.Types.ObjectId(req.user._id),
+        user: new mongoose.Types.ObjectId(String(req.user._id)),
       },
     },
     {
@@ -406,9 +514,7 @@ const getProductInUserCart = ApiHandler(async (req, res) => {
     },
     {
       $addFields: {
-        products: {
-          product,
-        },
+        products: "$product",
       },
     },
 
@@ -419,6 +525,7 @@ const getProductInUserCart = ApiHandler(async (req, res) => {
     },
   ]);
 
+  console.log(userProductsInCart);
   if (!userProductsInCart) {
     throw new ApiError(404, "error while fetching cart");
   }
@@ -426,15 +533,15 @@ const getProductInUserCart = ApiHandler(async (req, res) => {
   res
     .status(200)
     .json(
-      new ApiResponse(200, userProductsInCart[0], "Cart fetched successfully")
+      new ApiResponse(200, userProductsInCart, "Cart fetched successfully")
     );
 });
 
 const getUserWishList = ApiHandler(async (req, res) => {
-  const userWishList = await WishList.aggregate([
+  const userWishList = await Wishlist.aggregate([
     {
       $match: {
-        user: mongoose.Types.ObjectId(req.user._id),
+        user: new mongoose.Types.ObjectId(String(req.user._id)),
       },
     },
     {
@@ -450,9 +557,7 @@ const getUserWishList = ApiHandler(async (req, res) => {
     },
     {
       $addFields: {
-        products: {
-          product,
-        },
+        products: "$product",
       },
     },
     {
@@ -477,7 +582,7 @@ const getUserOrders = ApiHandler(async (req, res) => {
   const userOrders = await Order.aggregate([
     {
       $match: {
-        buyer: mongoose.Types.ObjectId(req.user._id),
+        buyer: new mongoose.Types.ObjectId(String(req.user._id)),
       },
     },
   ]);
@@ -500,11 +605,12 @@ export {
   updateUserPassword,
   createUserAddress,
   removeUserAddress,
-  getProductInUserCart as getUserCart,
+  getProductInUserCart,
   getUserWishList,
   logOutUser,
   getUserOrders,
   verifyOTP,
   reSendOTP,
   resetPassword,
+  refreshAccessToken,
 };
