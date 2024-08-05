@@ -2,10 +2,15 @@ import mongoose from "mongoose";
 import { Review } from "../models/review.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import ApiHandler from "../utils/ApiHandler.js";
+import { ApiError } from "../utils/ApiError.js";
 
 const addReview = ApiHandler(async (req, res) => {
   const { productId } = req.params;
   const { rating, content } = req.body;
+
+  if (!rating || !content) {
+    throw new ApiError(400, "All fields are required");
+  }
 
   if (!mongoose.isValidObjectId(productId)) {
     throw new ApiError(400, "Invalid product id");
@@ -37,6 +42,10 @@ const getMyReviews = ApiHandler(async (req, res) => {
 const updateMyReview = ApiHandler(async (req, res) => {
   const { reviewId } = req.params;
   const { rating, content } = req.body;
+
+  if (!rating || !content) {
+    throw new ApiError(400, "All fields are required");
+  }
 
   if (!mongoose.isValidObjectId(reviewId)) {
     throw new ApiError(400, "Invalid review id");

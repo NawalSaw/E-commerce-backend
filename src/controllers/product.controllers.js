@@ -8,156 +8,147 @@ import { Category } from "../models/category.model.js";
 import { Detail } from "../models/detail.model.js";
 import { Review } from "../models/review.model.js";
 import { uploadToCloudinary } from "../utils/uploadOnCloudinary.js";
+import { Shop } from "./../models/shop.model.js";
+import mongoose from "mongoose";
+import { v2 as cloudinary } from "cloudinary";
+import { aggregatePaginate } from "mongoose-aggregate-paginate-v2";
 
 // complex logic goes here
 
 const getAllProducts = ApiHandler(async (req, res) => {
   const {
-    query,
-    category,
-    brand,
-    minPrice,
-    maxPrice,
-    minRating,
-    inStock,
-    sortBy,
+    query = "",
+    category = "",
+    brand = "",
+    minPrice = "0",
+    maxPrice = "",
+    minRating = "0",
+    inStock = false,
+    sortBy = "createdAt",
+    sortType = "desc",
     page = 1,
     limit = 10,
   } = req.query;
 
-  let matchStage = {};
+  let pipeline = [];
+
   if (query) {
-    matchStage.$text = { $search: query };
+    const categoryByName = await Category.findOne({
+      name: { $regex: query, $options: "i" },
+    });
+    const detailByName = await Detail.findOne({
+      brand: { $regex: query, $options: "i" },
+    });
+    pipeline.push({
+      $match: {
+        $or: [
+          { name: { $regex: query, $options: "i" } },
+          { description: { $regex: query, $options: "i" } },
+          { category: categoryByName?._id },
+          { details: detailByName?._id },
+        ],
+      },
+    });
   }
+
   if (category) {
-    matchStage.category = category;
+    const categoryByName = await Category.findOne({
+      name: { $regex: category, $options: "i" },
+    });
+    pipeline.push({ $match: { category: categoryByName?._id } });
   }
+
   if (brand) {
-    matchStage.brand = brand;
+    const detailByName = await Detail.findOne({
+      brand: { $regex: brand, $options: "i" },
+    });
+    pipeline.push({ $match: { details: detailByName?._id } });
   }
-  if (minPrice || maxPrice) {
-    matchStage.price = {};
-    if (minPrice) matchStage.price.$gte = parseFloat(minPrice);
-    if (maxPrice) matchStage.price.$lte = parseFloat(maxPrice);
+
+  if (minPrice) {
+    pipeline.push({ $match: { price: { $gte: parseInt(minPrice) } } });
   }
+
+  if (maxPrice) {
+    pipeline.push({ $match: { price: { $lte: parseInt(maxPrice) } } });
+  }
+
   if (minRating) {
-    matchStage.rating = { $gte: parseFloat(minRating) };
-  }
-  if (inStock) {
-    matchStage.stock = { $gt: 0 };
+    pipeline.push({ $match: { avgRating: { $gte: parseInt(minRating) } } });
   }
 
-  let sortStage = {};
-  if (sortBy) {
-    const [field, order] = sortBy.split(":");
-    sortStage[field] = order === "desc" ? -1 : 1;
+  if (inStock === "true") {
+    pipeline.push({ $match: { inStock: true } });
   }
 
-  const skip = (page - 1) * limit;
+  if (sortBy || sortType) {
+    pipeline.push({
+      $sort: {
+        [sortBy]: sortType === "asc" ? 1 : -1,
+      },
+    });
+  }
 
-  const [products, facets] = await Promise.all([
-    Product.aggregate([
-      { $match: matchStage },
-      { $sort: { ...sortStage, score: { $meta: "textScore" } } },
-      { $skip: skip },
-      { $limit: parseInt(limit) },
-      {
-        $project: {
-          name: 1,
-          description: 1,
-          category: 1,
-          price: 1,
-          brand: 1,
-          rating: 1,
-          stock: 1,
-          score: { $meta: "textScore" },
-        },
-      },
-    ]),
-    Product.aggregate([
-      { $match: matchStage },
-      {
-        $lookup: {
-          from: "categories",
-          localField: "category",
-          foreignField: "_id",
-          as: "category",
-        },
-      },
-      {
-        $lookup: {
-          from: "details",
-          localField: "details",
-          foreignField: "_id",
-          as: "details",
-        },
-      },
-      {
-        $facet: {
-          categoryCounts: [
-            { $group: { _id: "$category", count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-          ],
-          brandCounts: [
-            { $group: { _id: "$details.brand", count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-          ],
-          priceRange: [
-            {
-              $group: {
-                _id: null,
-                minPrice: { $min: "$price" },
-                maxPrice: { $max: "$price" },
-              },
-            },
-          ],
-        },
-      },
-    ]),
-  ]);
-
-  const totalResults = await Product.countDocuments(matchStage);
-  const totalPages = Math.ceil(totalResults / limit);
-
-  res.json({
-    results: products,
+  const options = {
     page: parseInt(page),
-    totalPages,
-    totalResults,
-    facets: facets[0],
-  });
+    limit: parseInt(limit),
+  };
+
+  const products = await Product.aggregatePaginate(pipeline, options);
+
+  if (!products || products.length === 0) {
+    throw new ApiError(404, "Products not found");
+  }
+
+  res.status(200).json(new ApiResponse(200, products));
 });
 
 const autoComplete = ApiHandler(async (req, res) => {
-  const { term } = req.query;
+  const { query = "", limit = 10 } = req.query;
 
-  if (!term) {
-    return res.status(400).json({ error: "Search term is required" });
+  if (!query) {
+    throw new ApiError(400, "Query parameter is required");
   }
 
-  try {
-    const suggestions = await Product.aggregate([
-      {
-        $match: {
-          $text: { $search: term },
-        },
-      },
-      {
-        $project: {
-          name: 1,
-          score: { $meta: "textScore" },
-        },
-      },
-      { $sort: { score: { $meta: "textScore" } } },
-      { $limit: 10 },
-    ]);
+  // Using a regex for partial match and case-insensitivity
+  const matchStage = {
+    $or: [
+      { name: { $regex: query, $options: "i" } },
+      { description: { $regex: query, $options: "i" } },
+      { category: { $regex: query, $options: "i" } },
+      { brand: { $regex: query, $options: "i" } },
+    ],
+  };
 
-    res.json(suggestions);
-  } catch (error) {
-    res.status(500).json({
-      error: "An error occurred while fetching autocomplete suggestions",
-    });
-  }
+  const results = await Product.aggregate([
+    { $match: matchStage },
+    { $limit: parseInt(limit) },
+    {
+      $project: {
+        name: 1,
+        category: 1,
+        brand: 1,
+      },
+    },
+  ]);
+
+  // Extracting unique suggestions
+  const suggestions = results.map((result) => ({
+    name: result.name,
+    category: result.category,
+    brand: result.brand,
+  }));
+  // filter the unique values
+  const uniqueSuggestions = suggestions.filter(
+    (suggestion, index, self) =>
+      index === self.findIndex((s) => s.name === suggestion.name)
+  );
+  // sort the unique values
+  uniqueSuggestions.sort((a, b) =>
+    a.name.toLowerCase() > b.name.toLowerCase() ? 1 : -1
+  );
+
+  res.status(200).json(new ApiResponse(200, uniqueSuggestions));
 });
 
 const addProduct = ApiHandler(async (req, res) => {
@@ -199,20 +190,32 @@ const addProduct = ApiHandler(async (req, res) => {
     throw new ApiError(400, "All fields are required");
   }
 
-  const checkForShop = await Shop.findOne({ user: req.user._id });
+  const checkForShop = await Shop.findOne({ owner: req.user._id });
   if (!checkForShop) {
     throw new ApiError(400, "Please add a shop first");
   }
   const productPreviewLocalPath = req.files.productPreview.map(
     (file) => file.path
   );
+
   if (!productPreviewLocalPath) {
     throw new ApiError(404, "productPreview is required");
   }
 
-  const productPreview = await Promise.all(
-    uploadToCloudinary(productPreviewLocalPath)
-  );
+  const upload = async () => {
+    const uploadPromises = productPreviewLocalPath.map(async (preview) => {
+      const uploadResult = await uploadToCloudinary(preview);
+      return uploadResult;
+    });
+
+    // Wait for all upload promises to resolve
+    return await Promise.all(uploadPromises);
+  };
+
+  const productPreview = await upload();
+  const url = productPreview.map((object) => {
+    return object.url;
+  });
   if (!productPreview) {
     throw new ApiError(
       500,
@@ -224,7 +227,7 @@ const addProduct = ApiHandler(async (req, res) => {
     name,
     productPrice,
     inStock: true,
-    productPreview: [...productPreview.url],
+    productPreview: [...url],
     description,
     offer: null,
     category: null,
@@ -233,33 +236,44 @@ const addProduct = ApiHandler(async (req, res) => {
     details: null,
   };
 
+  console.log(product.productPreview);
+
   if (deliveryPrice) {
     product.deliveryPrice = deliveryPrice;
   }
 
-  const variationPreviewsLocalPath = req.files.variationPreviews.map(
-    (file) => file.path
-  );
+  if (
+    req.files &&
+    Array.isArray(req.files.variationPreviews) &&
+    req.files.variationPreviews.length > 0
+  ) {
+    const variationPreviewsLocalPath = req.files.variationPreviews.map(
+      (file) => file.path
+    );
+
+    return variationPreviewsLocalPath;
+  }
+
   if (
     variationType &&
     variation &&
     variationPrice &&
     variationPreviewsLocalPath
   ) {
-    const variationPreviews = await Promise.all(
-      uploadToCloudinary(variationPreviewsLocalPath)
+    const variationPreviewsPromises = await Promise.all(
+      variationPreviewsLocalPath.map(async (preview) => {
+        const uploadResult = await uploadToCloudinary(preview);
+        return uploadResult;
+      })
     );
-    if (!variationPreviews) {
-      throw new ApiError(
-        500,
-        "Something went wrong while uploading variationPreviews"
-      );
-    }
+    const url = variationPreviewsPromises.map((object) => {
+      return object.url;
+    });
     const newVariation = await Variation.create({
       type: variationType,
       variation,
       price: variationPrice,
-      previews: [...variationPreviews.url],
+      previews: [...url],
     });
 
     if (!newVariation) {
@@ -311,9 +325,11 @@ const addProduct = ApiHandler(async (req, res) => {
   }
 
   const details = await Detail.create({
+    material,
+    color,
+    origin,
     manufacturer,
     brand,
-    origin,
     explanation,
     shipsFrom,
     extraDetail,
@@ -325,12 +341,14 @@ const addProduct = ApiHandler(async (req, res) => {
     throw new ApiError(404, "error while creating detail");
   }
 
+  console.log(product);
+
   const newProduct = new Product({
     name: product.name,
     price: product.productPrice,
     inStock: product.inStock,
     deliveryPrice: product.deliveryPrice,
-    productPreview: product.productPreview,
+    previews: product.productPreview,
     description: product.description,
     offer: product.offer,
     category: product.category,
@@ -345,42 +363,18 @@ const addProduct = ApiHandler(async (req, res) => {
 
   await newProduct.save();
 
-  res.status(201).json(new ApiResponse(201, "Product created successfully"));
+  res
+    .status(201)
+    .json(new ApiResponse(201, newProduct, "Product created successfully"));
 });
 
 const addPreview = ApiHandler(async (req, res) => {
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
-
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  const owner = await Product.findById(req.params.productId).populate("shop");
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
-  const productPreview = req.file.productPreview.map((file) => file.path);
+  const productPreview = req.files.productPreview.map((file) => file.path);
   if (!productPreview) {
     throw new ApiError(404, "productPreview is required");
   }
@@ -390,15 +384,32 @@ const addPreview = ApiHandler(async (req, res) => {
     throw new ApiError(404, "Product not found");
   }
 
-  const productPreviewCloudinary = await uploadToCloudinary(productPreview);
-  if (!productPreviewCloudinary) {
+  // Upload the previews to Cloudinary
+  const productPreviewCloudinary = await Promise.all(
+    productPreview.map(async (file) => {
+      const upload = await uploadToCloudinary(file);
+      if (!upload) {
+        throw new ApiError(
+          500,
+          "Something went wrong while uploading productPreview"
+        );
+      }
+      return upload;
+    })
+  );
+
+  // Extract the URLs from the upload results
+  const urls = productPreviewCloudinary.map((upload) => upload.url);
+
+  if (!urls) {
     throw new ApiError(
       500,
       "Something went wrong while uploading productPreview"
     );
   }
 
-  product.previews.push(...productPreviewCloudinary.url);
+  // Add the URLs to the product previews
+  product.previews.push(...urls);
   await product.save();
 
   res
@@ -410,34 +421,9 @@ const removePreview = ApiHandler(async (req, res) => {
   const { productId } = req.params;
   const { preview } = req.body;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findById(productId).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -478,34 +464,8 @@ const updatePrimaryDetails = ApiHandler(async (req, res) => {
   const { productId } = req.params;
   const { price, deliveryPrice, description, name } = req.body;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
-
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  const owner = await Product.findById(productId).populate("shop");
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -548,34 +508,9 @@ const updatePrimaryDetails = ApiHandler(async (req, res) => {
 const toggleStock = ApiHandler(async (req, res) => {
   const { productId } = req.params;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findById(productId).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -605,34 +540,9 @@ const deleteProduct = ApiHandler(async (req, res) => {
     throw new ApiError(400, "productId is required");
   }
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findOne({ _id: productId }).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -646,34 +556,9 @@ const updateCategory = ApiHandler(async (req, res) => {
   const { productId } = req.params;
   const { categoryName, subCategoryName } = req.body;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findById(productId).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -729,37 +614,11 @@ const updateCategory = ApiHandler(async (req, res) => {
 
 const addVariation = ApiHandler(async (req, res) => {
   const { productId } = req.params;
-  const { variationType, variation, variationPrice, variationPreviews } =
-    req.body;
+  const { variationType, variation, variationPrice } = req.body;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findById(productId).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -767,12 +626,31 @@ const addVariation = ApiHandler(async (req, res) => {
     throw new ApiError(400, "productId is required");
   }
 
-  if (!variationType || !variation || !variationPrice || !variationPreviews) {
+  const variationPreviewsLocalPath = req.files.variationPreviews.map(
+    (file) => file.path
+  );
+
+  if (
+    !variationType ||
+    !variation ||
+    !variationPrice ||
+    !variationPreviewsLocalPath
+  ) {
     throw new ApiError(
       400,
       "variationType, variation, variationPrice and variationPreviews are required"
     );
   }
+
+  const variationPreviewsPromises = await Promise.all(
+    variationPreviewsLocalPath.map(async (preview) => {
+      const uploadResult = await uploadToCloudinary(preview);
+      return uploadResult;
+    })
+  );
+  const variationPreviews = variationPreviewsPromises.map((object) => {
+    return object.url;
+  });
 
   const product = await Product.findById(productId);
   if (!product) {
@@ -783,10 +661,10 @@ const addVariation = ApiHandler(async (req, res) => {
     type: variationType,
     variation,
     price: variationPrice,
-    previews: [variationPreviews],
+    previews: [...variationPreviews],
   });
 
-  product.variations.push(newVariation._id);
+  product.variation.push(newVariation._id);
   await product.save();
 
   res
@@ -796,44 +674,7 @@ const addVariation = ApiHandler(async (req, res) => {
 
 const updateVariation = ApiHandler(async (req, res) => {
   const { productId } = req.params;
-  const {
-    variationId,
-    variationType,
-    variation,
-    variationPrice,
-    variationPreviews,
-  } = req.body;
-
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
-
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
-    throw new ApiError(404, "You are not authorized to perform this action");
-  }
+  const { variationType, variation, variationPrice, variationId } = req.body;
 
   if (!productId) {
     throw new ApiError(400, "productId is required");
@@ -843,26 +684,59 @@ const updateVariation = ApiHandler(async (req, res) => {
     throw new ApiError(400, "variationId is required");
   }
 
+  // Extract the local paths of the variation previews if they exist
+  const variationPreviewsLocalPath = req.files?.variationPreviews?.map(
+    (file) => file.path
+  );
+
+  // Validate input
+  if (
+    !variationType &&
+    !variation &&
+    !variationPrice &&
+    !variationPreviewsLocalPath
+  ) {
+    throw new ApiError(400, "At least one field is required");
+  }
+
+  // Find the product and verify the user's authorization
+  const product = await Product.findById(productId).populate("shop");
+  if (!product || product.shop.owner.toString() !== req.user._id.toString()) {
+    throw new ApiError(404, "You are not authorized to perform this action");
+  }
+
+  // Find the variation info
   const variationInfo = await Variation.findById(variationId);
   if (!variationInfo) {
     throw new ApiError(404, "Variation not found");
   }
 
-  if (variationType) {
-    variationInfo.type = variationType;
+  // Upload the variation previews to Cloudinary if they exist
+  let variationPreviews = [];
+  if (variationPreviewsLocalPath) {
+    const variationPreviewsPromises = variationPreviewsLocalPath.map(
+      async (preview) => {
+        const uploadResult = await uploadToCloudinary(preview);
+        return uploadResult.url;
+      }
+    );
+    variationPreviews = await Promise.all(variationPreviewsPromises);
   }
 
-  if (variation) {
-    variationInfo.variation = variation;
-  }
+  // Update the variation info
+  if (variationType) variationInfo.type = variationType;
+  if (variation) variationInfo.variation = variation;
+  if (variationPrice) variationInfo.price = variationPrice;
+  if (variationPreviews.length > 0)
+    variationInfo.previews.push(...variationPreviews);
 
-  if (variationPrice) {
-    variationInfo.price = variationPrice;
-  }
+  await variationInfo.save();
 
-  if (variationPreviews) {
-    variationInfo.previews.push(variationPreviews);
-  }
+  res
+    .status(200)
+    .json(
+      new ApiResponse(200, variationInfo, "Variation updated successfully")
+    );
 });
 
 const deleteVariation = ApiHandler(async (req, res) => {
@@ -872,34 +746,8 @@ const deleteVariation = ApiHandler(async (req, res) => {
     throw new ApiError(400, "productId is required");
   }
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
-
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  const owner = await Product.findById(productId).populate("shop");
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
@@ -933,48 +781,25 @@ const addOffer = ApiHandler(async (req, res) => {
     throw new ApiError(400, "productId is required");
   }
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  const owner = await Product.findById(productId).populate("shop");
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
-  if (!offerType || !offerValue) {
+  if (!offerType) {
     throw new ApiError(400, "offer is required");
   }
 
   const newOffer = await Offer.create({
-    type: offerType,
-    value: offerValue,
+    offerType,
   });
 
   if (!newOffer) {
     throw new ApiError(404, "error while creating offer");
+  }
+  if (offerValue) {
+    newOffer.offerValue = offerValue;
   }
 
   const product = await Product.findByIdAndUpdate(
@@ -996,43 +821,26 @@ const removeOffer = ApiHandler(async (req, res) => {
     throw new ApiError(400, "productId is required");
   }
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
-
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  const product = await Product.findById(productId).populate("shop");
+  if (product && product.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
-  const product = await Product.findByIdAndUpdate(
+  if (!product.offer) {
+    throw new ApiError(404, "Offer not found");
+  }
+
+  const offer = await Offer.findByIdAndDelete(product.offer);
+  if (!offer) {
+    throw new ApiError(404, "Offer not found");
+  }
+
+  const updatedProduct = await Product.findByIdAndUpdate(
     { _id: productId },
     { offer: null },
     { new: true }
   );
-  if (!product) {
+  if (!updatedProduct) {
     throw new ApiError(404, "Product not found");
   }
 
@@ -1042,7 +850,7 @@ const removeOffer = ApiHandler(async (req, res) => {
 });
 
 const updateDetails = ApiHandler(async (req, res) => {
-  const { productId } = req.params;
+  const { productId, detailId } = req.params;
   const {
     material,
     color,
@@ -1054,42 +862,17 @@ const updateDetails = ApiHandler(async (req, res) => {
     extraDetail,
   } = req.body;
 
-  const owner = await Product.aggregate([
-    { $match: { _id: req.params.productId } },
-    {
-      $lookup: {
-        from: "shops",
-        localField: "shop",
-        foreignField: "_id",
-        as: "shop",
-        pipeline: [
-          {
-            $project: {
-              _id: 0,
-              owner: 1,
-            },
-          },
-        ],
-      },
-    },
+  if (!productId) {
+    throw new ApiError(400, "productId is required");
+  }
 
-    {
-      $project: {
-        _id: 0,
-        shop: 1,
-      },
-    },
-  ]);
-
-  if (owner && owner[0].toString() !== req.user._id.toString()) {
+  const owner = await Product.findById(productId).populate("shop");
+  if (owner && owner.shop.owner.toString() !== req.user._id.toString()) {
     throw new ApiError(404, "You are not authorized to perform this action");
   }
 
-  const product = await Product.findById(productId);
-  const details = await Detail.findById(product.details);
-  if (!product) {
-    throw new ApiError(404, "Product not found");
-  }
+  const details = await Detail.findById(detailId);
+
   if (!details) {
     throw new ApiError(404, "Details not found");
   }
@@ -1141,7 +924,7 @@ const getProductById = ApiHandler(async (req, res) => {
   const product = await Product.aggregate([
     {
       $match: {
-        _id: mongoose.Types.ObjectId(String(productId)),
+        _id: new mongoose.Types.ObjectId(String(productId)),
       },
     },
 
@@ -1285,9 +1068,7 @@ const getProductById = ApiHandler(async (req, res) => {
   const avgRating = await Review.aggregate([
     {
       $match: {
-        product:
-          mongoose.Types.ObjectId(String(productId)) ||
-          mongoose.Types.ObjectId(productId),
+        product: new mongoose.Types.ObjectId(String(productId)),
       },
     },
     {
@@ -1309,6 +1090,16 @@ const getProductById = ApiHandler(async (req, res) => {
   if (!product) {
     throw new ApiError(404, "Product not found");
   }
+  const updatedProduct = await Product.findByIdAndUpdate(
+    { _id: productId },
+    { $set: { avgRating: avgRating[0] || "5" } }
+  );
+
+  if (!updatedProduct) {
+    throw new ApiError(404, "Product not found");
+  }
+
+  console.log(avgRating);
 
   res
     .status(200)
@@ -1331,6 +1122,10 @@ const getReviews = ApiHandler(async (req, res) => {
   const reviews = await Review.find({ product: productId })
     .populate("owner")
     .select("-product");
+
+  if (!reviews) {
+    throw new ApiError(404, "Reviews not found");
+  }
   res
     .status(200)
     .json(new ApiResponse(200, reviews, "Reviews found successfully"));

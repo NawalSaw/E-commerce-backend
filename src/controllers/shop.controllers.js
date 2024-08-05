@@ -1,12 +1,21 @@
 import mongoose from "mongoose";
 import { Shop } from "../models/shop.model.js";
 import ApiHandler from "../utils/ApiHandler.js";
+import { ApiError } from "../utils/ApiError.js";
+import ApiResponse from "../utils/ApiResponse.js";
 
 const createShop = ApiHandler(async (req, res) => {
   const { name, localAddress, pincode, city, state, country } = req.body;
   if (!name || !localAddress || !pincode || !city || !state || !country) {
     throw new ApiError(400, "All fields are required");
   }
+
+  const existingShop = await Shop.findOne({ owner: req.user._id });
+
+  if (existingShop) {
+    throw new ApiError(400, "Shop already exists");
+  }
+
   const newShop = await Shop.create({
     name,
     owner: req.user._id,
@@ -35,7 +44,7 @@ const getShopById = ApiHandler(async (req, res) => {
   }
 
   const shop = await Shop.aggregate([
-    { $match: { _id: mongoose.Types.ObjectId(shopId) } },
+    { $match: { _id: new mongoose.Types.ObjectId(shopId) } },
     {
       $lookup: {
         from: "users",
@@ -55,7 +64,7 @@ const getShopById = ApiHandler(async (req, res) => {
     },
   ]);
 
-  if (!shop) {
+  if (!shop || shop.length === 0) {
     throw new ApiError(404, "Shop not found");
   }
 
@@ -83,7 +92,7 @@ const getMyShop = ApiHandler(async (req, res) => {
     },
   ]);
 
-  if (!shop) {
+  if (!shop || shop.length === 0) {
     throw new ApiError(404, "Shop not found or you have'nt created any shop");
   }
 
@@ -96,43 +105,35 @@ const updateMyShop = ApiHandler(async (req, res) => {
     throw new ApiError(400, "At least one field is required");
   }
 
-  let detailToBeUpdated = {};
+  const shop = await Shop.findOne({ owner: req.user._id });
+  if (!shop) {
+    throw new ApiError(404, "Shop not found");
+  }
 
   if (name) {
-    detailToBeUpdated.name = name;
+    shop.name = name;
   }
   if (localAddress) {
-    detailToBeUpdated.localAddress = localAddress;
+    shop.address.localAddress = localAddress;
   }
   if (pincode) {
-    detailToBeUpdated.pincode = pincode;
+    shop.address.pincode = pincode;
   }
   if (city) {
-    detailToBeUpdated.city = city;
+    shop.address.city = city;
   }
   if (state) {
-    detailToBeUpdated.state = state;
+    shop.address.state = state;
   }
   if (country) {
-    detailToBeUpdated.country = country;
+    shop.address.country = country;
   }
+  await shop.save();
 
-  const updatedShop = await Shop.findByIdAndUpdate(
-    req.user._id,
-    { $set: detailToBeUpdated },
-    { new: true }
-  );
-
-  if (!updatedShop) {
-    throw new ApiError(404, "error while updating shop");
-  }
-
-  res
-    .status(200)
-    .json(new ApiResponse(200, updatedShop, "Shop updated successfully"));
+  res.status(200).json(new ApiResponse(200, shop, "Shop updated successfully"));
 });
 const deleteShop = ApiHandler(async (req, res) => {
-  const deletedShop = await Shop.findByIdAndDelete({ owner: req.user._id });
+  const deletedShop = await Shop.findOneAndDelete({ owner: req.user._id });
 
   if (!deletedShop) {
     throw new ApiError(404, "error while deleting shop");

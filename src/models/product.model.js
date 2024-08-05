@@ -16,7 +16,6 @@ const productSchema = new mongoose.Schema({
   },
   deliveryPrice: {
     type: String,
-    required: true,
   },
   offer: {
     type: mongoose.Schema.Types.ObjectId,
@@ -41,10 +40,15 @@ const productSchema = new mongoose.Schema({
   shop: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Shop",
+    required: true,
   },
   details: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Detail",
+  },
+  avgRating: {
+    type: Number,
+    default: 5,
   },
 });
 

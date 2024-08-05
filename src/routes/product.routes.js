@@ -1,6 +1,9 @@
 import express from "express";
-import { getAllProducts } from "../controllers/product.controllers.js";
-import { autoComplete } from "../controllers/product.controllers.js";
+import {
+  autoComplete,
+  getAllProducts,
+  removeOffer,
+} from "../controllers/product.controllers.js";
 import { addProduct } from "../controllers/product.controllers.js";
 import JWTCheck from "./../middlewares/auth.middleware.js";
 import { upload } from "../middlewares/multer.middleware.js";
@@ -28,26 +31,25 @@ router
   .post(
     upload.fields([{ name: "productPreview" }, { name: "variationPreviews" }]),
     addProduct
-  )
-  .delete(deleteProduct);
+  );
+
+router.route("/:productId").delete(deleteProduct);
 router
   .route("/a/:productId")
-  .patch(upload.fields(["productPreview"]), addPreview);
+  .patch(upload.fields([{ name: "productPreview" }]), addPreview);
 
-router
-  .route("/r/:productId")
-  .patch(upload.fields(["productPreview"]), removePreview);
+router.route("/r/:productId").patch(removePreview);
 
 router.route("/u/primary/:productId").patch(updatePrimaryDetails);
 router.route("/toggle-stock/:productId").patch(toggleStock);
 router.route("/c/:productId").patch(updateCategory);
 router
   .route("/variation/:productId")
-  .post(addVariation)
-  .patch(updateVariation)
+  .post(upload.fields([{ name: "variationPreviews" }]), addVariation)
+  .patch(upload.fields([{ name: "variationPreviews" }]), updateVariation)
   .delete(deleteVariation);
-router.route("/offer/:productId").post(addOffer).delete(deleteProduct);
-router.route("/details/u/:productId").patch(updateDetails);
+router.route("/offer/:productId").post(addOffer).delete(removeOffer);
+router.route("/details/u/:productId/:detailId").patch(updateDetails);
 router.route("/:productId").get(getProductById);
 router.route("/reviews/:productId").get(getReviews);
 
