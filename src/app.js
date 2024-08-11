@@ -24,7 +24,9 @@ import productRoute from "./routes/product.routes.js";
 import opinionRoute from "./routes/opinion.routes.js";
 import shopRoute from "./routes/shop.routes.js";
 import reviewRoute from "./routes/review.routes.js";
+import cartRoutes from "./routes/cart.routes.js";
 
+app.use("/api/v1/carts", cartRoutes);
 app.use("/api/v1/opinions", opinionRoute);
 app.use("/api/v1/reviews", reviewRoute);
 app.use("/api/v1/shops", shopRoute);
